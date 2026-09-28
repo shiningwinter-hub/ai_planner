@@ -1,4 +1,4 @@
-const MODEL = 'gemini-3.5-flash-lite';
+const MODEL = 'gemini-3.5-flash';
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST 요청만 지원합니다.' });

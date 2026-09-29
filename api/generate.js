@@ -1,5 +1,6 @@
-const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
-const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.1-flash-lite';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+const FALLBACK_MODEL =
+  process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash';
 
 function parseEvents(answer) {
   const parsed = JSON.parse(answer);

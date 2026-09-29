@@ -1,147 +1,88 @@
 const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
-const FALLBACK_MODEL =
-  process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.1-flash-lite';
+const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.1-flash-lite';
+
+function parseEvents(answer) {
+  const parsed = JSON.parse(answer);
+  if (!parsed || !Array.isArray(parsed.events)) throw new Error('events 배열이 없습니다.');
+  return parsed;
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
+  if (req.method !== 'POST') return res.status(405).json({ error: 'POST 요청만 지원합니다.' });
+  if (!process.env.GEMINI_API_KEY) return res.status(503).json({ error: 'GEMINI_API_KEY 환경변수를 설정해 주세요.' });
 
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'POST 요청만 지원합니다.' });
+  const { task, input, context } = req.body || {};
+  if (!['parse', 'coach', 'report'].includes(task) || typeof input !== 'string' || input.length > 3000 || !context || JSON.stringify(context).length > 25000) {
+    return res.status(400).json({ error: '요청 형식이 올바르지 않습니다.' });
   }
 
-  if (!process.env.GEMINI_API_KEY) {
-    return res.status(503).json({
-      error: '서버에 GEMINI_API_KEY를 설정해 주세요.',
-    });
-  }
+  const instruction = task === 'parse'
+    ? '강의 일정을 추출해 JSON으로 반환하세요. events 배열의 각 항목은 date(YYYY-MM-DD), start(HH:mm), end(HH:mm), title, place, travel(편도 분), method(public 또는 drive), kind(new/existing/repeat/assist/other), prep(준비 분)을 포함합니다. note에는 불확실한 정보를 적으세요. 불확실한 날짜나 시간은 추측하지 말고 events에서 제외하세요. 왕복 이동시간이면 편도로 반분하세요. 상대 날짜는 today를 기준으로 계산하세요.'
+    : task === 'report'
+      ? '기록과 일정만 근거로 한국어 3문장 이내의 따뜻하고 구체적인 하루 피드백을 작성하세요. 기록이 없으면 추측하지 마세요.'
+      : '일정·목표·컨디션만 근거로 한국어 3문장 이내의 실행 가능한 추천을 작성하세요. 확정되지 않은 일정을 확정했다고 말하지 마세요.';
 
-  try {
-    const { task, input, context } = req.body || {};
+  const payload = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: `${instruction}\n입력: ${input}\n상황: ${JSON.stringify(context)}` }] }],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 4096,
+      ...(task === 'parse' ? { responseMimeType: 'application/json' } : {}),
+    },
+  });
 
-    if (
-      !['parse', 'coach', 'report'].includes(task) ||
-      typeof input !== 'string' ||
-      input.length > 3000 ||
-      !context ||
-      JSON.stringify(context).length > 25000
-    ) {
-      return res.status(400).json({
-        error: '요청 형식이 올바르지 않습니다.',
+  const models = [...new Set([MODEL, FALLBACK_MODEL])];
+  let lastStatus = 0;
+  let lastCode = '';
+
+  for (let attempt = 0; attempt < models.length; attempt++) {
+    const model = models[attempt];
+    let response, data;
+    try {
+      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+        body: payload,
+        signal: AbortSignal.timeout(8000),
       });
-    }
-
-    const instruction =
-      task === 'parse'
-        ? `JSON만 반환: {"events":[{"date":"YYYY-MM-DD","start":"HH:mm","end":"HH:mm","title":"강의 제목","place":"장소","travel":60,"method":"public 또는 drive","kind":"new 또는 existing 또는 repeat 또는 assist 또는 other","prep":60}],"note":"해석 결과"}. 강의 일정만 events에 넣어라. 불확실한 날짜/시간은 추측하지 말고 events에서 제외하고 note에 확인 요청. 왕복 이동시간이면 편도로 반분. 날짜는 context.today 기준.`
-        : task === 'report'
-          ? '제공된 기록과 일정만 근거로 한국어 3문장 이내의 따뜻하고 구체적인 하루 피드백을 작성하라. 기록이 없으면 추측하지 말라.'
-          : '제공된 일정·공부 목표·컨디션만 근거로 한국어 3문장 이내로 실행 가능한 추천을 작성하라. 실제 확정되지 않은 일정을 확정했다고 말하지 말라.';
-
-    const payload = JSON.stringify({
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: `${instruction}\n입력: ${input}\n상황: ${JSON.stringify(context)}`,
-            },
-          ],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.25,
-        maxOutputTokens: 900,
-        ...(task === 'parse'
-          ? { responseMimeType: 'application/json' }
-          : {}),
-      },
-    });
-
-    let response;
-    let data;
-    let usedModel = MODEL;
-
-    // 기본 모델에서 503이 나면 한 번 재시도하고 대체 모델을 사용합니다.
-    for (const model of [MODEL, MODEL, FALLBACK_MODEL]) {
-      usedModel = model;
-
-      response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': process.env.GEMINI_API_KEY,
-          },
-          body: payload,
-          signal: AbortSignal.timeout(20000),
-        },
-      );
-
       data = await response.json();
-
-      if (response.ok) break;
-
-      console.error('Gemini API failure', {
-        model,
-        status: response.status,
-        code: data.error?.status,
-        message: data.error?.message,
-      });
-
-      if (response.status !== 503) break;
-
-      if (model === MODEL) {
-        await new Promise((resolve) => setTimeout(resolve, 600));
-      }
+    } catch (error) {
+      console.error('Gemini network failure', { model, name: error.name });
+      if (attempt < models.length - 1) continue;
+      return res.status(502).json({ error: 'Gemini 연결 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.' });
     }
 
     if (!response.ok) {
-      const code = data.error?.status || `HTTP_${response.status}`;
-
-      const guidance =
-        response.status === 404
-          ? '모델 접근 권한이 없습니다. Vercel의 GEMINI_MODEL 설정을 확인해 주세요.'
-          : response.status === 429
-            ? '호출 한도를 초과했습니다. Google AI Studio의 할당량을 확인해 주세요.'
-            : response.status === 503
-              ? '기본 모델과 대체 모델이 모두 일시적으로 이용 불가합니다. 잠시 후 다시 시도해 주세요.'
-              : [400, 401, 403].includes(response.status)
-                ? 'API 키·모델 사용 권한·요청 설정을 확인해 주세요.'
-                : '잠시 후 다시 시도해 주세요.';
-
-      return res.status(502).json({
-        error: `Gemini ${response.status} (${code}, ${usedModel}): ${guidance}`,
-      });
+      lastStatus = response.status;
+      lastCode = data.error?.status || `HTTP_${response.status}`;
+      console.error('Gemini API failure', { model, status: lastStatus, code: lastCode, message: data.error?.message });
+      if (response.status === 503 && attempt < models.length - 1) continue;
+      const guidance = response.status === 404 ? '모델 접근 권한을 확인해 주세요.'
+        : response.status === 429 ? '호출 한도를 확인해 주세요.'
+        : response.status === 503 ? '서비스가 일시적으로 이용 불가합니다.'
+        : [400, 401, 403].includes(response.status) ? 'API 키와 요청 권한을 확인해 주세요.'
+        : '잠시 후 다시 시도해 주세요.';
+      return res.status(502).json({ error: `Gemini ${lastStatus} (${lastCode}, ${model}): ${guidance}` });
     }
 
-    const answer =
-      data.candidates?.[0]?.content?.parts
-        ?.map((part) => part.text || '')
-        .join('') || '';
-
+    const answer = data.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('') || '';
     if (!answer) {
-      return res.status(502).json({
-        error: 'AI 응답이 비어 있습니다.',
-      });
+      console.error('Gemini empty response', { model, finishReason: data.candidates?.[0]?.finishReason });
+      if (attempt < models.length - 1) continue;
+      return res.status(502).json({ error: 'Gemini 응답이 비어 있습니다.' });
     }
 
     if (task === 'parse') {
-      const parsed = JSON.parse(answer);
-
-      if (!Array.isArray(parsed.events)) {
-        throw new Error('Invalid response');
+      try {
+        return res.json({ result: parseEvents(answer) });
+      } catch (error) {
+        console.error('Gemini invalid JSON', { model, finishReason: data.candidates?.[0]?.finishReason, length: answer.length });
+        if (attempt < models.length - 1) continue;
+        return res.status(502).json({ error: 'AI 일정 해석 결과가 불완전합니다. 문장을 짧게 나누어 다시 시도해 주세요.' });
       }
-
-      return res.json({ result: parsed });
     }
-
     return res.json({ result: answer.slice(0, 4000) });
-  } catch (error) {
-    console.error('Generate function failure', error);
-
-    return res.status(500).json({
-      error: '요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.',
-    });
   }
+  return res.status(502).json({ error: 'AI 응답을 처리하지 못했습니다.' });
 };
